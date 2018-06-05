@@ -5,6 +5,7 @@ require 'json'
 require 'socket'
 require 'digest/sha1'
 require 'set'
+require 'hashdiff'
 
 class Synapse::ConfigGenerator
   class Haproxy < BaseGenerator
@@ -797,6 +798,11 @@ class Synapse::ConfigGenerator
     DEFAULT_STATE_FILE_TTL = (60 * 60 * 24).freeze # 24 hours
     STATE_FILE_UPDATE_INTERVAL = 60.freeze # iterations; not a unit of time
     DEFAULT_BIND_ADDRESS = 'localhost'
+    # It's unclear how many servers HAProxy can have in one backend, but 65k
+    # should be enough for anyone right (famous last words)?
+    MAX_SERVER_ID = (2**16 - 1).freeze
+
+    attr_reader :server_id_map, :state_cache
 
     def initialize(opts)
       super(opts)
@@ -808,7 +814,6 @@ class Synapse::ConfigGenerator
       @opts['do_writes'] = true unless @opts.key?('do_writes')
       @opts['do_socket'] = true unless @opts.key?('do_socket')
       @opts['do_reloads'] = true unless @opts.key?('do_reloads')
-
       req_pairs = {
         'do_writes' => 'config_file_path',
         'do_socket' => 'socket_file_path',
@@ -842,8 +847,22 @@ class Synapse::ConfigGenerator
       @backends_cache = {}
       @watcher_revisions = {}
 
-      @state_file_path = @opts['state_file_path']
-      @state_file_ttl = @opts.fetch('state_file_ttl', DEFAULT_STATE_FILE_TTL).to_i
+      @state_cache = HaproxyState.new(
+        @opts['state_file_path'],
+        @opts.fetch('state_file_ttl', DEFAULT_STATE_FILE_TTL).to_i,
+        self
+      )
+
+      # For giving consistent orders, even if they are random
+      @server_order_seed = @opts.fetch('server_order_seed', rand(2000)).to_i
+      @max_server_id = @opts.fetch('max_server_id', MAX_SERVER_ID).to_i
+      # Map of backend names -> hash of HAProxy server names -> puids
+      # (server->id aka "name") to their proxy unique id (server->puid aka "id")
+      @server_id_map = Hash.new{|h,k| h[k] = {}}
+      # Map of backend names -> hash of HAProxy server puids -> names
+      # (server->puid aka "id") to their name (server->id aka "name")
+      @id_server_map = Hash.new{|h,k| h[k] = {}}
+
     end
 
     def normalize_watcher_provided_config(service_watcher_name, service_watcher_config)
@@ -893,6 +912,10 @@ class Synapse::ConfigGenerator
       end
     end
 
+    def update_state_file(watchers)
+      @state_cache.update_state_file(watchers)
+    end
+
     # generates a new config based on the state of the watchers
     def generate_config(watchers)
       new_config = generate_base_config
@@ -900,8 +923,15 @@ class Synapse::ConfigGenerator
 
       watchers.each do |watcher|
         watcher_config = watcher.config_for_generator[name]
-        @watcher_configs[watcher.name] ||= parse_watcher_config(watcher)
-        next if watcher_config['disabled']
+        next if watcher_config.nil? || watcher_config.empty? || watcher_config['disabled']
+        @watcher_configs[watcher.name] = parse_watcher_config(watcher)
+
+        # if watcher_config is changed, trigger restart
+        config_diff = HashDiff.diff(@state_cache.config_for_generator(watcher.name), watcher_config)
+        if !config_diff.empty?
+          log.info "synapse: restart required because config_for_generator changed. before: #{@state_cache.config_for_generator(watcher.name)}, after: #{watcher_config}"
+          @restart_required = true
+        end
 
         regenerate = watcher.revision != @watcher_revisions[watcher.name] ||
                      @frontends_cache[watcher.name].nil? ||
@@ -1037,8 +1067,13 @@ class Synapse::ConfigGenerator
 
       # The ordering here is important.  First we add all the backends in the
       # disabled state...
-      seen.fetch(watcher.name, []).each do |backend_name, backend|
+      @state_cache.backends(watcher.name).each do |backend_name, backend|
         backends[backend_name] = backend.merge('enabled' => false)
+        # We remember the haproxy_server_id from a previous reload here.
+        # Note though that if live servers below define haproxy_server_id
+        # that overrides the remembered value
+        @server_id_map[watcher.name][backend_name] ||= backends[backend_name]['haproxy_server_id']
+        @id_server_map[watcher.name][@server_id_map[watcher.name][backend_name]] = backend_name if @server_id_map[watcher.name][backend_name]
       end
 
       # ... and then we overwite any backends that the watchers know about,
@@ -1054,9 +1089,36 @@ class Synapse::ConfigGenerator
             log.info "synapse: restart required because haproxy_server_options changed for #{backend_name}"
             @restart_required = true
           end
+
+          if(@opts['use_nerve_weights'] && old_backend.fetch('weight', "") != backend.fetch('weight', ""))
+            log.info "synapse: restart required because weight changed for #{backend_name}"
+            @restart_required = true
+          end
         end
+
         backends[backend_name] = backend.merge('enabled' => true)
+
+        # If the the registry defines the haproxy_server_id that must be preferred.
+        # Note that the order here is important, because if haproxy_server_options
+        # does define an id, then we will write that out below, so that must be what
+        # is in the id_map as well.
+        @server_id_map[watcher.name][backend_name] = backend['haproxy_server_id'].to_i if backend['haproxy_server_id']
+        server_opts = backend['haproxy_server_options'].split(' ') if backend['haproxy_server_options'].is_a? String
+        @server_id_map[watcher.name][backend_name] = server_opts[server_opts.index('id') + 1].to_i if server_opts && server_opts.include?('id')
+        @id_server_map[watcher.name][@server_id_map[watcher.name][backend_name]] = backend_name
       end
+
+      # Now that we know the maximum possible existing haproxy_server_id for
+      # this backend, we can set any that don't exist yet.
+      watcher.backends.each do |backend|
+        backend_name = construct_name(backend)
+        @server_id_map[watcher.name][backend_name] ||= find_next_id(watcher.name, backend_name)
+        @id_server_map[watcher.name][@server_id_map[watcher.name][backend_name]] = backend_name
+      end
+      # Remove any servers that don't exist anymore from the server_id_map
+      # to control memory growth
+      @server_id_map[watcher.name].keep_if { |server_name| backends.has_key?(server_name) }
+      @id_server_map[watcher.name].keep_if { |_, server_name| @server_id_map[watcher.name][server_name] }
 
       if watcher.backends.empty?
         log.debug "synapse: no backends found for watcher #{watcher.name}"
@@ -1071,7 +1133,7 @@ class Synapse::ConfigGenerator
       when 'no_shuffle'
         backends.keys
       else
-        backends.keys.shuffle
+        backends.keys.shuffle(random: Random.new(@server_order_seed))
       end
 
       stanza = [
@@ -1079,7 +1141,19 @@ class Synapse::ConfigGenerator
         config.map {|c| "\t#{c}"},
         keys.map {|backend_name|
           backend = backends[backend_name]
+          backend_template_vars = {
+            :host => backend['host'],
+            :port => backend['port'],
+            :name => backend_name,
+          }
           b = "\tserver #{backend_name} #{backend['host']}:#{backend['port']}"
+
+          # Again, if the registry defines an id, we can't set it.
+          has_id = backend['haproxy_server_options'].split(' ').include?('id') if backend['haproxy_server_options'].is_a? String
+          if (!has_id && @server_id_map[watcher.name][backend_name])
+            b = "#{b} id #{@server_id_map[watcher.name][backend_name]}"
+          end
+
           unless config.include?('mode tcp')
             b = case watcher_config['cookie_value_method']
             when 'hash'
@@ -1088,11 +1162,51 @@ class Synapse::ConfigGenerator
               b = "#{b} cookie #{backend_name}"
             end
           end
-          b = "#{b} #{watcher_config['server_options']}" if watcher_config['server_options']
-          b = "#{b} #{backend['haproxy_server_options']}" if backend['haproxy_server_options']
+
+          if @opts['use_nerve_weights'] && backend['weight'] && (backend['weight'].is_a? Integer)
+            clean_server_options = remove_weight_option watcher_config['server_options']
+            clean_haproxy_server_options = remove_weight_option backend['haproxy_server_options']
+            if clean_server_options != watcher_config['server_options']
+                log.warn "synapse: weight is defined in both server_options and nerve. nerve weight will take precedence"
+            end
+            if clean_haproxy_server_options != backend['haproxy_server_options']
+                log.warn "synapse: weight is defined in both haproxy_server_options and nerve. nerve weight will take precedence"
+            end
+            b = "#{b} #{clean_server_options % backend_template_vars}" if clean_server_options
+            b = "#{b} #{clean_haproxy_server_options % backend_template_vars}" if clean_haproxy_server_options
+
+            weight = backend['weight'].to_i
+            b = "#{b} weight #{weight}".squeeze(" ")
+          else
+            b = "#{b} #{watcher_config['server_options'] % backend_template_vars}" if watcher_config['server_options'].is_a? String
+            b = "#{b} #{backend['haproxy_server_options'] % backend_template_vars}" if backend['haproxy_server_options'].is_a? String
+          end
           b = "#{b} disabled" unless backend['enabled']
           b }
       ]
+    end
+
+    def remove_weight_option(server_options)
+      if server_options.is_a? String
+        server_options = server_options.sub /weight +[0-9]+/,''
+      end
+      server_options
+    end
+
+    def find_next_id(watcher_name, backend_name)
+      probe = nil
+      if @server_id_map[watcher_name].size >= @max_server_id
+        log.error "synapse: ran out of server ids for #{watcher_name}, if you need more increase the max_server_id option"
+        return probe
+      end
+
+      probe = 1
+
+      while @id_server_map[watcher_name].include?(probe)
+        probe = (probe % @max_server_id) + 1
+      end
+
+      probe
     end
 
     def talk_to_socket(socket_file_path, command)
@@ -1205,7 +1319,9 @@ class Synapse::ConfigGenerator
       if old_config == new_config
         return false
       else
-        File.open(opts['config_file_path'],'w') {|f| f.write(new_config)}
+        tmp_file_path = "#{opts['config_file_path']}.tmp"
+        File.write(tmp_file_path, new_config)
+        FileUtils.mv(tmp_file_path, opts['config_file_path'])
         return true
       end
     end
@@ -1244,66 +1360,113 @@ class Synapse::ConfigGenerator
     ######################################
     # methods for managing the state file
     ######################################
-    def seen
-      # if we don't support the state file, return nothing
-      return {} if @state_file_path.nil?
+    class HaproxyState
+      include Synapse::Logging
 
-      # if we've never needed the backends, now is the time to load them
-      @seen = read_state_file if @seen.nil?
+      # TODO: enable version in the Haproxy Cache File
+      KEY_WATCHER_CONFIG_FOR_GENERATOR = "watcher_config_for_generator"
+      NON_BACKENDS_KEYS = [KEY_WATCHER_CONFIG_FOR_GENERATOR]
 
-      @seen
-    end
+      def initialize(state_file_path, state_file_ttl, haproxy)
+        @state_file_path = state_file_path
+        @state_file_ttl = state_file_ttl
+        @haproxy = haproxy
+      end
 
-    def update_state_file(watchers)
-      # if we don't support the state file, do nothing
-      return if @state_file_path.nil?
+      def backends(watcher_name)
+        if seen.key?(watcher_name)
+          seen[watcher_name].select { |section, data| !NON_BACKENDS_KEYS.include?(section) }
+        else
+          {}
+        end
+      end
 
-      log.info "synapse: writing state file"
-      timestamp = Time.now.to_i
+      def config_for_generator(watcher_name)
+        cache_config = {}
+        if seen.key?(watcher_name) && seen[watcher_name].key?(KEY_WATCHER_CONFIG_FOR_GENERATOR)
+          cache_config = seen[watcher_name][KEY_WATCHER_CONFIG_FOR_GENERATOR]
+        end
 
-      # Remove stale backends
-      seen.each do |watcher_name, backends|
-        backends.each do |backend_name, backend|
-          ts = backend.fetch('timestamp', 0)
-          delta = (timestamp - ts).abs
-          if delta > @state_file_ttl
-            log.info "synapse: expiring #{backend_name} with age #{delta}"
-            backends.delete(backend_name)
+        cache_config
+      end
+
+      def update_state_file(watchers)
+        # if we don't support the state file, do nothing
+        return if @state_file_path.nil?
+
+        log.info "synapse: writing state file"
+        timestamp = Time.now.to_i
+
+        # Remove stale backends
+        seen.each do |watcher_name, data|
+          backends(watcher_name).each do |backend_name, backend|
+            ts = backend.fetch('timestamp', 0)
+            delta = (timestamp - ts).abs
+            if delta > @state_file_ttl
+              log.info "synapse: expiring #{backend_name} with age #{delta}"
+              data.delete(backend_name)
+            end
           end
         end
-      end
 
-      # Remove any services which no longer have any backends
-      seen.reject!{|watcher_name, backends| backends.keys.length == 0}
+        # Remove any services which no longer have any backends
+        seen.reject!{|watcher_name, data| backends(watcher_name).keys.length == 0}
 
-      # Add backends from watchers
-      watchers.each do |watcher|
-        seen[watcher.name] ||= {}
+        # Add backends and config from watchers
+        watchers.each do |watcher|
+          seen[watcher.name] ||= {}
 
-        watcher.backends.each do |backend|
-          backend_name = construct_name(backend)
-          seen[watcher.name][backend_name] = backend.merge('timestamp' => timestamp)
+          watcher.backends.each do |backend|
+            backend_name = @haproxy.construct_name(backend)
+            data = {
+              'timestamp' => timestamp,
+            }
+            server_id = @haproxy.server_id_map[watcher.name][backend_name].to_i
+            if server_id && server_id > 0 && server_id <= MAX_SERVER_ID
+              data['haproxy_server_id'] = server_id
+            end
+
+            seen[watcher.name][backend_name] = data.merge(backend)
+          end
+
+          # Add config for generator from watcher
+          if watcher.config_for_generator.key?(@haproxy.name)
+            seen[watcher.name][KEY_WATCHER_CONFIG_FOR_GENERATOR] =
+              watcher.config_for_generator[@haproxy.name]
+          end
         end
+
+        # write the data!
+        write_data_to_state_file(seen)
       end
 
-      # write the data!
-      write_data_to_state_file(seen)
-    end
+      private
 
-    def read_state_file
-      # Some versions of JSON return nil on an empty file ...
-      JSON.load(File.read(@state_file_path)) || {}
-    rescue StandardError => e
-      # It's ok if the state file doesn't exist or contains invalid data
-      # The state file will be rebuilt automatically
-      {}
-    end
+      def seen
+        # if we don't support the state file, return nothing
+        return {} if @state_file_path.nil?
 
-    # we do this atomically so the state file is always consistent
-    def write_data_to_state_file(data)
-      tmp_state_file_path = @state_file_path + ".tmp"
-      File.write(tmp_state_file_path, JSON.pretty_generate(data))
-      FileUtils.mv(tmp_state_file_path, @state_file_path)
+        # if we've never needed the backends, now is the time to load them
+        @seen = read_state_file if @seen.nil?
+
+        @seen
+      end
+
+      def read_state_file
+        # Some versions of JSON return nil on an empty file ...
+        JSON.load(File.read(@state_file_path)) || {}
+      rescue StandardError => e
+        # It's ok if the state file doesn't exist or contains invalid data
+        # The state file will be rebuilt automatically
+        {}
+      end
+
+      # we do this atomically so the state file is always consistent
+      def write_data_to_state_file(data)
+        tmp_state_file_path = @state_file_path + ".tmp"
+        File.write(tmp_state_file_path, JSON.pretty_generate(data))
+        FileUtils.mv(tmp_state_file_path, @state_file_path)
+      end
     end
   end
 end

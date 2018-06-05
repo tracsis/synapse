@@ -34,11 +34,11 @@ are proven routing components like [HAProxy](http://haproxy.1wt.eu/) or [NGINX](
 For every external service that your application talks to, we assign a synapse local port on localhost.
 Synapse creates a proxy from the local port to the service, and you reconfigure your application to talk to the proxy.
 
-Under the hood, Synapse sports `service_watcher`s for service discovery and
+Under the hood, Synapse supports `service_watcher`s for service discovery and
 `config_generators` for configuring local state (e.g. load balancer configs)
 based on that service discovery state.
 
-Synapse supports service discovery with with pluggable `service_watcher`s which
+Synapse supports service discovery with pluggable `service_watcher`s which
 take care of signaling to the `config_generators` so that they can react and
 reconfigure to point at available servers on the fly.
 
@@ -183,7 +183,7 @@ relevant routing component. For example if you want to only configure HAProxy an
 not NGINX for a particular service, you would pass ``disabled`` to the `nginx` section
 of that service's watcher config.
 
-* [`haproxy`](#haproxysvc): how will the haproxy section for this service be configured
+* [`haproxy`](#haproxysvc): how will the haproxy section for this service be configured. If the corresponding `watcher` is defined to use `zookeeper` and the service publishes its `haproxy` configure on ZK, the `haproxy` hash can be filled/updated via data from the ZK node. 
 * [`nginx`](https://github.com/jolynch/synapse-nginx#service-watcher-config): how will the nginx section for this service be configured. **NOTE** to use this you must have the synapse-nginx [plugin](#plugins) installed.
 
 The services hash may contain the following additional keys:
@@ -221,7 +221,7 @@ Given a `label_filters`: `[{ "label": "cluster", "value": "dev", "condition": "e
 
 ##### Zookeeper #####
 
-This watcher retrieves a list of servers from zookeeper.
+This watcher retrieves a list of servers and also service config data from zookeeper.
 It takes the following mandatory arguments:
 
 * `method`: zookeeper
@@ -229,6 +229,9 @@ It takes the following mandatory arguments:
 * `hosts`: the list of zookeeper servers to query
 
 The watcher assumes that each node under `path` represents a service server.
+
+The watcher assumes that the data (if any) retrieved at znode `path` is a hash, where each key is named by a valid `config_generator` (e.g. `haproxy`) and the value is a hash that configs the generator.   Alternatively, if a `generator_config_path` argument is specified, the watcher will attempt to read generator config from that znode instead.
+If `generator_config_path` has the value `disabled`, then generator config will not be read from zookeeper at all.
 
 The following arguments are optional:
 
@@ -336,15 +339,21 @@ different addresses (example: service1 listen on 127.0.0.2:443 and service2
 listen on 127.0.0.3:443) allows /etc/hosts entries to point to services.
 * `bind_options`: optional: default value is an empty string, specify additional bind parameters, such as ssl accept-proxy, crt, ciphers etc.
 * `server_port_override`: **DEPRECATED**. Renamed [`backend_port_override`](#backend_port_override) and moved to the top level hash. This will be removed in future versions.
-* `server_options`: the haproxy options for each `server` line of the service in HAProxy config; it may be left out.
+* `server_options`: the haproxy options for each `server` line of the service in HAProxy config; it may be left out. This field supports some basic templating: you can add include `%{port}`, `%{host}`, or `%{name}` in this string, and those will be replaced with the appropriate values for the particular server being configured.
 * `frontend`: additional lines passed to the HAProxy config in the `frontend` stanza of this service
 * `backend`: additional lines passed to the HAProxy config in the `backend` stanza of this service
 * `backend_name`: The name of the generated HAProxy backend for this service
   (defaults to the service's key in the `services` section)
 * `listen`: these lines will be parsed and placed in the correct `frontend`/`backend` section as applicable; you can put lines which are the same for the frontend and backend here.
-* `backend_order`: optional: how backends should be ordered in the `backend` stanza. (default is shuffling). Setting to `asc` means sorting backends in ascending alphabetical order before generating stanza. `desc` means descending alphabetical order. `no_shuffle` means no shuffling or sorting.
+* `backend_order`: optional: how backends should be ordered in the `backend` stanza. (default is shuffling).
+  Setting to `asc` means sorting backends in ascending alphabetical order before generating stanza.
+  `desc` means descending alphabetical order.
+  `no_shuffle` means no shuffling or sorting.
+  If you shuffle consider setting `server_order_seed` at the top level so that your backend
+  ordering is deterministic across HAProxy reloads.
 * `shared_frontend`: optional: haproxy configuration directives for a shared http frontend (see below)
 * `cookie_value_method`: optional: default value is `name`, it defines the way your backends receive a cookie value in http mode. If equal to `hash`, synapse hashes backend names on cookie value assignation of your discovered backends, useful when you want to use haproxy cookie feature but you do not want that your end users receive a Set-Cookie with your server name and ip readable in clear.
+* `use_nerve_weights`: optional: this option enables reading the weights from nerve and applying them to the haproxy configuration. By default this is disabled in the case where users apply weights using `server_options` or `haproxy_server_options`.  This option will also remove the weight parameter from `server_options` and `haproxy_server_options`
 
 <a name="haproxy"/>
 
@@ -376,6 +385,19 @@ The top level `haproxy` section of the config file has the following options:
 * `state_file_ttl`: the number of seconds that backends should be kept in the
   state file cache.  This only applies if `state_file_path` is provided.
   (default: 86400)
+* `server_order_seed`: A number to seed random actions with so that all orders are
+  deterministic. You can use this so that backend ordering is deterministic
+  but still shuffled, for example by setting this to the hash of your machine's
+  IP address you guarantee that HAProxy on different machines have different
+  orders, but within that machine you always choose the same order.
+  (default: ``rand(2000)``)
+* `max_server_id`: Synapse will try to ensure that server lines are written out
+  with HAProxy "id"s that are unique and associated 1:1 with a service backend
+  (host + port + name). To ensure these are unique Synapse internally counts
+  up from 1 until `max_server_id`, so you can have no more than this number
+  of servers in a backend. If the default (65k) is not enough, make this higher
+  but be wary that HAProxy internally uses an int to store this id, so ...
+  your mileage may vary trying to make this higher. (default: 65535)
 
 Note that a non-default `bind_address` can be dangerous.
 If you configure an `address:port` combination that is already in use on the system, haproxy will fail to start.

@@ -51,8 +51,9 @@ class Synapse::ServiceWatcher
       # Overrides the discovery_servers method on the parent class
       attr_accessor :discovery_servers
 
-      def initialize(opts={}, synapse, message_queue)
+      def initialize(opts={}, parent=nil, synapse, message_queue)
         @message_queue = message_queue
+        @parent = parent
 
         super(opts, synapse)
       end
@@ -94,6 +95,11 @@ class Synapse::ServiceWatcher
             unless last_resolution == current_resolution
               last_resolution = current_resolution
               configure_backends(last_resolution)
+
+              # Propagate revision updates down to ZookeeperDnsWatcher, so
+              # that stanza cache can work properly.
+              @revision += 1
+              @parent.reconfigure! unless @parent.nil?
             end
           end
         end
@@ -107,10 +113,11 @@ class Synapse::ServiceWatcher
     end
 
     class Zookeeper < Synapse::ServiceWatcher::ZookeeperWatcher
-      def initialize(opts={}, synapse, message_queue)
+      def initialize(opts={}, parent=nil, synapse, message_queue)
         super(opts, synapse)
 
         @message_queue = message_queue
+        @parent = parent
       end
 
       # Overrides reconfigure! to cause the new list of servers to be messaged
@@ -118,6 +125,10 @@ class Synapse::ServiceWatcher
       def reconfigure!
         # push the new backends onto the queue
         @message_queue.push(Messages::NewServers.new(@backends))
+        # Propagate revision updates down to ZookeeperDnsWatcher, so
+        # that stanza cache can work properly.
+        @revision += 1
+        @parent.reconfigure! unless @parent.nil?
       end
 
       private
@@ -142,12 +153,14 @@ class Synapse::ServiceWatcher
 
       @dns = Dns.new(
         mk_child_watcher_opts(dns_discovery_opts),
+        self,
         @synapse,
         @message_queue
       )
 
       @zk = Zookeeper.new(
         mk_child_watcher_opts(zookeeper_discovery_opts),
+        self,
         @synapse,
         @message_queue
       )
@@ -186,6 +199,12 @@ class Synapse::ServiceWatcher
       @dns.backends
     end
 
+    # Override reconfigure! as this class should not explicitly reconfigure
+    # synapse
+    def reconfigure!
+      @revision += 1
+    end
+
     private
 
     def validate_discovery_opts
@@ -221,11 +240,6 @@ class Synapse::ServiceWatcher
         'discovery' => discovery_opts,
         'default_servers' => @default_servers,
       }
-    end
-
-    # Override reconfigure! as this class should not explicitly reconfigure
-    # synapse
-    def reconfigure!
     end
   end
 end

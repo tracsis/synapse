@@ -30,12 +30,14 @@ class Synapse::ServiceWatcher
     end
 
     def start
-      @zk_hosts = @discovery['hosts'].sort.join(',')
+      zk_host_list = @discovery['hosts'].sort
+      @zk_cluster = host_list_to_cluster(zk_host_list)
+      @zk_hosts = zk_host_list.join(',')
 
       @watcher = nil
       @zk = nil
 
-      log.info "synapse: starting ZK watcher #{@name} @ hosts: #{@zk_hosts}, path: #{@discovery['path']}"
+      log.info "synapse: starting ZK watcher #{@name} @ cluster #{@zk_cluster} path: #{@discovery['path']}"
       zk_connect
     end
 
@@ -47,10 +49,21 @@ class Synapse::ServiceWatcher
     def ping?
       # @zk being nil implies no session *or* a lost session, do not remove
       # the check on @zk being truthy
-      @zk && @zk.connected?
+      # if the client is in any of the three states: associating, connecting, connected
+      # we consider it alive. this can avoid synapse restart on short network dis-connection
+      @zk && (@zk.associating? || @zk.connecting? || @zk.connected?)
     end
 
     private
+
+    def host_list_to_cluster(list)
+      first_host = list.sort.first
+      first_token = first_host.split('.').first
+      # extract cluster name by filtering name of first host
+      # remove domain extents and trailing numbers
+      last_non_number = first_token.rindex(/[^0-9]/)
+      last_non_number ? first_token[0..last_non_number] : first_host
+    end
 
     def validate_discovery_opts
       raise ArgumentError, "invalid discovery method #{@discovery['method']}" \
@@ -123,41 +136,75 @@ class Synapse::ServiceWatcher
 
     # find the current backends at the discovery path
     def discover
-      log.info "synapse: discovering backends for service #{@name}"
+      statsd_increment('synapse.watcher.zk.discovery', ["zk_cluster:#{@zk_cluster}", "zk_path:#{@discovery['path']}", "service_name:#{@name}"])
+      statsd_time('synapse.watcher.zk.discovery.elapsed_time', ["zk_cluster:#{@zk_cluster}", "zk_path:#{@discovery['path']}", "service_name:#{@name}"]) do
+        log.info "synapse: discovering backends for service #{@name}"
 
-      new_backends = []
-      @zk.children(@discovery['path'], :watch => true).each do |id|
-        begin
-          node = @zk.get("#{@discovery['path']}/#{id}")
-        rescue ZK::Exceptions::NoNode => e
-          # This can happen when the registry unregisters a service node between
-          # the call to @zk.children and @zk.get(path). ZK does not guarantee
-          # a read to ``get`` of a child returned by ``children`` will succeed
-          log.error("synapse: #{@discovery['path']}/#{id} disappeared before it could be read: #{e}")
-          next
+        new_backends = []
+        @zk.children(@discovery['path'], :watch => true).each do |id|
+          begin
+            node = statsd_time('synapse.watcher.zk.get.elapsed_time', ["zk_cluster:#{@zk_cluster}", "service_name:#{@name}"]) do
+              @zk.get("#{@discovery['path']}/#{id}")
+            end
+          rescue ZK::Exceptions::NoNode => e
+            # This can happen when the registry unregisters a service node between
+            # the call to @zk.children and @zk.get(path). ZK does not guarantee
+            # a read to ``get`` of a child returned by ``children`` will succeed
+            log.error("synapse: #{@discovery['path']}/#{id} disappeared before it could be read: #{e}")
+            next
+          end
+
+          begin
+            # TODO: Do less munging, or refactor out this processing
+            host, port, name, weight, haproxy_server_options, labels = deserialize_service_instance(node.first)
+          rescue StandardError => e
+            log.error "synapse: invalid data in ZK node #{id} at #{@discovery['path']}: #{e}"
+          else
+            # find the numberic id in the node name; used for leader elections if enabled
+            numeric_id = id.split('_').last
+            numeric_id = NUMBERS_RE =~ numeric_id ? numeric_id.to_i : nil
+
+            log.debug "synapse: discovered backend #{name} at #{host}:#{port} for service #{@name}"
+            new_backends << {
+              'name' => name, 'host' => host, 'port' => port,
+              'id' => numeric_id, 'weight' => weight,
+              'haproxy_server_options' => haproxy_server_options,
+              'labels' => labels
+            }
+          end
         end
 
-        begin
-          # TODO: Do less munging, or refactor out this processing
-          host, port, name, weight, haproxy_server_options, labels = deserialize_service_instance(node.first)
-        rescue StandardError => e
-          log.error "synapse: invalid data in ZK node #{id} at #{@discovery['path']}: #{e}"
+        # support for a separate 'generator_config_path' key, for reading the
+        # generator config block, that may be different from the 'path' key where
+        # we discover service instances. if generator_config_path is present and
+        # the value is "disabled", then skip all zk-based discovery of the
+        # generator config (and use the values from the local config.json
+        # instead).
+        case @discovery.fetch('generator_config_path', nil)
+        when 'disabled'
+          discovery_key = nil
+        when nil
+          discovery_key = 'path'
         else
-          # find the numberic id in the node name; used for leader elections if enabled
-          numeric_id = id.split('_').last
-          numeric_id = NUMBERS_RE =~ numeric_id ? numeric_id.to_i : nil
-
-          log.debug "synapse: discovered backend #{name} at #{host}:#{port} for service #{@name}"
-          new_backends << {
-            'name' => name, 'host' => host, 'port' => port,
-            'id' => numeric_id, 'weight' => weight,
-            'haproxy_server_options' => haproxy_server_options,
-            'labels' => labels
-          }
+          discovery_key = 'generator_config_path'
         end
-      end
 
-      set_backends(new_backends)
+        if discovery_key
+          node = statsd_time('synapse.watcher.zk.get.elapsed_time', ["zk_cluster:#{@zk_cluster}", "service_name:#{@name}"]) do
+            @zk.get(@discovery[discovery_key], :watch => true)
+          end
+          begin
+            new_config_for_generator = parse_service_config(node.first)
+          rescue StandardError => e
+            log.error "synapse: invalid config data in ZK node at #{@discovery[discovery_key]}: #{e}"
+            new_config_for_generator = {}
+          end
+        else
+          new_config_for_generator = {}
+        end
+
+        set_backends(new_backends, new_config_for_generator)
+      end
     end
 
     # sets up zookeeper callbacks if the data at the discovery path changes
@@ -165,12 +212,14 @@ class Synapse::ServiceWatcher
       return if @zk.nil?
       log.debug "synapse: setting watch at #{@discovery['path']}"
 
-      @watcher = @zk.register(@discovery['path'], &watcher_callback) unless @watcher
+      statsd_time('synapse.watcher.zk.watch.elapsed_time', ["zk_cluster:#{@zk_cluster}", "zk_path:#{@discovery['path']}", "service_name:#{@name}"]) do
+        @watcher = @zk.register(@discovery['path'], &watcher_callback) unless @watcher
 
-      # Verify that we actually set up the watcher.
-      unless @zk.exists?(@discovery['path'], :watch => true)
-        log.error "synapse: zookeeper watcher path #{@discovery['path']} does not exist!"
-        zk_cleanup
+        # Verify that we actually set up the watcher.
+        unless @zk.exists?(@discovery['path'], :watch => true)
+          log.error "synapse: zookeeper watcher path #{@discovery['path']} does not exist!"
+          zk_cleanup
+        end
       end
       log.debug "synapse: set watch at #{@discovery['path']}"
     end
@@ -213,37 +262,44 @@ class Synapse::ServiceWatcher
     end
 
     def zk_connect
-      log.info "synapse: zookeeper watcher connecting to ZK at #{@zk_hosts}"
+      statsd_time('synapse.watcher.zk.connect.elapsed_time', ["zk_cluster:#{@zk_cluster}", "service_name:#{@name}"]) do
+        log.info "synapse: zookeeper watcher connecting to ZK at #{@zk_hosts}"
 
-      # Ensure that all Zookeeper watcher re-use a single zookeeper
-      # connection to any given set of zk hosts.
-      @@zk_pool_lock.synchronize {
-        unless @@zk_pool.has_key?(@zk_hosts)
-          log.info "synapse: creating pooled connection to #{@zk_hosts}"
-          @@zk_pool[@zk_hosts] = ZK.new(@zk_hosts, :timeout => 5, :thread => :per_callback)
-          @@zk_pool_count[@zk_hosts] = 1
-          log.info "synapse: successfully created zk connection to #{@zk_hosts}"
-        else
-          @@zk_pool_count[@zk_hosts] += 1
-          log.info "synapse: re-using existing zookeeper connection to #{@zk_hosts}"
+        # Ensure that all Zookeeper watcher re-use a single zookeeper
+        # connection to any given set of zk hosts.
+        @@zk_pool_lock.synchronize {
+          unless @@zk_pool.has_key?(@zk_hosts)
+            log.info "synapse: creating pooled connection to #{@zk_hosts}"
+            @@zk_pool[@zk_hosts] = ZK.new(@zk_hosts, :timeout => 5, :thread => :per_callback)
+            @@zk_pool_count[@zk_hosts] = 1
+            log.info "synapse: successfully created zk connection to #{@zk_hosts}"
+            statsd_increment('synapse.watcher.zk.client.created', ["zk_cluster:#{@zk_cluster}", "service_name:#{@name}"])
+          else
+            @@zk_pool_count[@zk_hosts] += 1
+            log.info "synapse: re-using existing zookeeper connection to #{@zk_hosts}"
+            statsd_increment('synapse.watcher.zk.client.reused', ["zk_cluster:#{@zk_cluster}", "service_name:#{@name}"])
+          end
+        }
+
+        @zk = @@zk_pool[@zk_hosts]
+        log.info "synapse: retrieved zk connection to #{@zk_hosts}"
+
+        # handle session expiry -- by cleaning up zk, this will make `ping?`
+        # fail and so synapse will exit
+        @zk.on_expired_session do
+          statsd_increment('synapse.watcher.zk.session.expired', ["zk_cluster:#{@zk_cluster}", "service_name:#{@name}"])
+          log.warn "synapse: zookeeper watcher ZK session expired!"
+          zk_cleanup
         end
-      }
 
-      @zk = @@zk_pool[@zk_hosts]
-      log.info "synapse: retrieved zk connection to #{@zk_hosts}"
+        # the path must exist, otherwise watch callbacks will not work
+        statsd_time('synapse.watcher.zk.create_path.elapsed_time', ["zk_cluster:#{@zk_cluster}", "service_name:#{@name}"]) do
+          create(@discovery['path'])
+        end
 
-      # handle session expiry -- by cleaning up zk, this will make `ping?`
-      # fail and so synapse will exit
-      @zk.on_expired_session do
-        log.warn "synapse: zookeeper watcher ZK session expired!"
-        zk_cleanup
+        # call the callback to bootstrap the process
+        watcher_callback.call
       end
-
-      # the path must exist, otherwise watch callbacks will not work
-      create(@discovery['path'])
-
-      # call the callback to bootstrap the process
-      watcher_callback.call
     end
 
     # decode the data at a zookeeper endpoint
@@ -259,6 +315,37 @@ class Synapse::ServiceWatcher
       labels = decoded['labels'] || nil
 
       return host, port, name, weight, haproxy_server_options, labels
+    end
+
+    def parse_service_config(data)
+      log.debug "synapse: deserializing process data"
+      if data.nil? || data.empty?
+        decoded = {}
+      else
+        decoded = @decode_method.call(data)
+      end
+
+      new_generator_config = {}
+      # validate the config. if the config is not empty:
+      #   each key should be named by one of the available generators
+      #   each value should be a hash (could be empty)
+      decoded.collect.each do |generator_name, generator_config|
+        if !@synapse.available_generators.keys.include?(generator_name)
+          log.error "synapse: invalid generator name in ZK node at #{@discovery['path']}:" \
+            " #{generator_name}"
+          next
+        else
+          if generator_config.nil? || !generator_config.is_a?(Hash)
+            log.warn "synapse: invalid generator config in ZK node at #{@discovery['path']}" \
+            " for generator #{generator_name}"
+            new_generator_config[generator_name] = {}
+          else
+            new_generator_config[generator_name] = generator_config
+          end
+        end
+      end
+
+      return new_generator_config
     end
   end
 end
