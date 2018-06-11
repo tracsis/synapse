@@ -8,7 +8,11 @@ module Synapse
     end
 
     def statsd_increment(key, tags = [])
-      statsd.increment(key, tags: tags, sample_rate: sample_rate_for(key))
+      if @@STATSD_FORMAT_DATADOG
+        statsd.increment(key, tags: tags, sample_rate: sample_rate_for(key))
+      else
+        statsd.increment(key, tags: [], sample_rate: sample_rate_for(key))
+      end
     end
 
     def statsd_time(key, tags = [])
@@ -23,6 +27,7 @@ module Synapse
       @@STATSD_HOST = "localhost"
       @@STATSD_PORT = 8125
       @@STATSD_SAMPLE_RATE = {}
+      @@STATSD_FORMAT_DATADOG = true
 
       def statsd_for(classname)
         log.debug "synapse: creating statsd client for class '#{classname}' on host '#{@@STATSD_HOST}' port #{@@STATSD_PORT}"
@@ -33,7 +38,12 @@ module Synapse
         @@STATSD_HOST = opts['host'] || @@STATSD_HOST
         @@STATSD_PORT = (opts['port'] || @@STATSD_PORT).to_i
         @@STATSD_SAMPLE_RATE = opts['sample_rate'] || {}
-        log.info "synapse: configuring statsd on host '#{@@STATSD_HOST}' port #{@@STATSD_PORT}"
+        @@STATSD_FORMAT_DATADOG = ((opts['format'] || "datadog") == "datadog")
+        if @@STATSD_FORMAT_DATADOG
+          log.info "synapse: configuring statsd for datadogging on host '#{@@STATSD_HOST}' port #{@@STATSD_PORT}"
+        else
+          log.info "synapse: configuring statsd for normal behaviour on host '#{@@STATSD_HOST}' port #{@@STATSD_PORT}"
+        end
       end
     end
 

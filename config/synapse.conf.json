@@ -97,6 +97,7 @@
       "synapse.watcher.zk.discovery.elapsed_time": 0.7,
       "synapse.watcher.zk.get.elapsed_time": 0.5,
       "synapse.watcher.zk.watch.elapsed_time": 0.7
-    }
+    },
+    "format": "datadog"
   }
 }
