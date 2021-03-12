@@ -16,8 +16,14 @@ module Synapse
     end
 
     def statsd_time(key, tags = [])
-      statsd.time(key, tags: tags, sample_rate: sample_rate_for(key)) do
-        yield
+      if @@STATSD_FORMAT_DATADOG
+        statsd.time(key, tags: tags, sample_rate: sample_rate_for(key)) do
+          yield
+        end
+      else
+        statsd.time(key, tags: [], sample_rate: sample_rate_for(key)) do
+          yield
+        end
       end
     end
 
