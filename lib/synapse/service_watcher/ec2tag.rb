@@ -85,6 +85,14 @@ class Synapse::ServiceWatcher
     def discover_instances
       AWS.memoize do
         instances = instances_with_tags(@discovery['tag_name'], @discovery['tag_value'])
+        if @discovery['backup_tag_name'] && @discovery['backup_tag_value']
+          backup_instances =
+            @ec2.instances
+              .tagged(@discovery['backup_tag_name'])
+              .tagged_values(@discovery['backup_tag_value'])
+              .select { |i| i.status == :running || i.status == :stopped }
+          instances = instances + backup_instances
+        end
 
         new_backends = []
 
