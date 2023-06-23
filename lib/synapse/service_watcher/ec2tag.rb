@@ -10,12 +10,7 @@ class Synapse::ServiceWatcher
       region = @discovery['aws_region'] || ENV['AWS_REGION']
       log.info "Connecting to EC2 region: #{region}"
 
-      unless ((@discovery['aws_access_key_id'] || ENV['aws_access_key_id']) \
-              && (@discovery['aws_secret_access_key'] || ENV['aws_secret_access_key'] ))
-        AWS.config(:credential_provider => AWS::Core::CredentialProviders::EC2Provider.new(:retries => 0))
-      end
-
-      @ec2 = AWS::EC2.new(
+      @ec2 = Aws::EC2::Resource.new(
         region:            region,
         access_key_id:     @discovery['aws_access_key_id']     || ENV['AWS_ACCESS_KEY_ID'],
         secret_access_key: @discovery['aws_secret_access_key'] || ENV['AWS_SECRET_ACCESS_KEY'] )
@@ -83,17 +78,7 @@ class Synapse::ServiceWatcher
     end
 
     def discover_instances
-      AWS.memoize do
         instances = instances_with_tags(@discovery['tag_name'], @discovery['tag_value'])
-        if @discovery['backup_tag_name'] && @discovery['backup_tag_value']
-          backup_instances =
-            @ec2.instances
-              .tagged(@discovery['backup_tag_name'])
-              .tagged_values(@discovery['backup_tag_value'])
-              .select { |i| i.status == :running || i.status == :stopped }
-          instances = instances + backup_instances
-        end
-
         new_backends = []
 
         # choice of private_dns_name, dns_name, private_ip_address or
@@ -105,15 +90,45 @@ class Synapse::ServiceWatcher
           }
         end
 
+        if @discovery['backup_tag_name'] && @discovery['backup_tag_value']
+          backup_instances =
+            @ec2.instances({
+              filters: [
+                {
+                  name: "tag:#{@discovery['backup_tag_name']}",
+                  values: [ @discovery['backup_tag_value'] ],
+                },
+                {
+                  name: "instance-state-name",
+                  values: ["stopped", "running"]
+                }
+            ]
+          })
+
+          backup_instances.each do |instance|
+            new_backends << {
+              'name' => instance.private_dns_name,
+              'host' => instance.private_ip_address,
+            }
+          end
+        end
+
         new_backends
-      end
     end
 
     def instances_with_tags(tag_name, tag_value)
-      @ec2.instances
-        .tagged(tag_name)
-        .tagged_values(tag_value)
-        .select { |i| i.status == :running }
+      @ec2.instances({
+          filters: [
+            {
+              name: "tag:#{tag_name}",
+              values: tag_value,
+            },
+            {
+              name: "instance-state-name",
+              values: ["running"]
+            }
+          ]
+        })
     end
   end
 end
