@@ -2,7 +2,7 @@ PATH
   remote: .
   specs:
     synapse (0.16.0)
-      aws-sdk-ec2 (= 1.386)
+      aws-sdk-ec2 (~> 1.386)
       docker-api (~> 1.7)
       dogstatsd-ruby (~> 3.3.0)
       hashdiff (~> 0.2.3)
@@ -13,16 +13,12 @@ PATH
 GEM
   remote: https://rubygems.org/
   specs:
-    activesupport (7.1.3)
-      base64
-      bigdecimal
+    activesupport (6.1.7.6)
       concurrent-ruby (~> 1.0, >= 1.0.2)
-      connection_pool (>= 2.2.5)
-      drb
       i18n (>= 1.6, < 2)
       minitest (>= 5.1)
-      mutex_m
       tzinfo (~> 2.0)
+      zeitwerk (~> 2.3)
     addressable (2.8.6)
       public_suffix (>= 2.0.2, < 6.0)
     aws-eventstream (1.3.0)
@@ -32,17 +28,15 @@ GEM
       aws-partitions (~> 1, >= 1.651.0)
       aws-sigv4 (~> 1.8)
       jmespath (~> 1, >= 1.6.1)
-    aws-sdk-ec2 (1.386.0)
-      aws-sdk-core (~> 3, >= 3.174.0)
+    aws-sdk-ec2 (1.437.0)
+      aws-sdk-core (~> 3, >= 3.191.0)
       aws-sigv4 (~> 1.1)
     aws-sigv4 (1.8.0)
       aws-eventstream (~> 1, >= 1.0.2)
-    base64 (0.2.0)
     bigdecimal (3.1.6)
     bigdecimal (3.1.6-java)
     coderay (1.1.3)
     concurrent-ruby (1.2.3)
-    connection_pool (2.4.1)
     crack (0.4.6)
       bigdecimal
       rexml
@@ -51,8 +45,6 @@ GEM
       excon (>= 0.47.0)
       multi_json
     dogstatsd-ruby (3.3.0)
-    drb (2.2.0)
-      ruby2_keywords
     excon (0.109.0)
     factory_girl (4.9.0)
       activesupport (>= 3.0.0)
@@ -66,9 +58,8 @@ GEM
       little-plugger (>= 1.1.3)
       multi_json (>= 1.8.4)
     method_source (1.0.0)
-    minitest (5.22.1)
+    minitest (5.15.0)
     multi_json (1.15.0)
-    mutex_m (0.2.0)
     pry (0.14.2)
       coderay (~> 1.1)
       method_source (~> 1.0)
@@ -78,7 +69,7 @@ GEM
       spoon (~> 0.0)
     pry-nav (1.0.0)
       pry (>= 0.9.10, < 0.15)
-    public_suffix (5.0.4)
+    public_suffix (4.0.7)
     rake (13.1.0)
     rexml (3.2.6)
     rspec (3.1.0)
@@ -93,7 +84,6 @@ GEM
     rspec-mocks (3.1.3)
       rspec-support (~> 3.1.0)
     rspec-support (3.1.2)
-    ruby2_keywords (0.0.5)
     slyphon-log4j (1.2.15)
     slyphon-zookeeper_jar (3.3.5-java)
     spoon (0.0.6)
@@ -105,6 +95,7 @@ GEM
       addressable (>= 2.3.6)
       crack (>= 0.3.2)
       hashdiff
+    zeitwerk (2.6.13)
     zk (1.10.0)
       zookeeper (~> 1.5.0)
     zookeeper (1.5.5)
