@@ -62,7 +62,22 @@ if config.has_key?('service_conf_dir')
 end
 
 # run synapse
-s = Synapse::Synapse.new(config)
-s.run
+
+loop do
+  s = Synapse::Synapse.new(config)
+  begin
+    s.run
+    break # Exit normally
+  rescue SystemExit, SignalException
+    break # Exit upon exit or signal
+  rescue Exception => e
+    puts "Caught exception at top level: #{e.inspect}"
+    puts "Cleaning up all threads"
+    Thread.list.each do |thread|
+      thread.exit unless thread == Thread.current
+      puts "Exited thread #{thread.inspect}"
+    end
+  end
+end
 
 puts "synapse has exited"
