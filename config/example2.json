@@ -1,0 +1,61 @@
+{
+  "services": {
+    "test1": {
+      "discovery": {
+        "method": "zookeeper",
+        "path": "/test1/services/test/services",
+        "hosts": [
+          "localhost:2181"
+        ]
+      },
+      "haproxy": {
+        "port": 1000,
+        "server_options": "check inter 2s rise 3 fall 2",
+        "listen": [
+          "mode tcp"
+        ]
+      }
+    }
+  },
+  "haproxy": {
+    "reload_command": "sudo service haproxy reload",
+    "config_file_path": "/etc/haproxy/haproxy.cfg",
+    "socket_file_path": "/var/haproxy/stats.sock",
+    "do_writes": true,
+    "do_reloads": true,
+    "do_socket": false,
+    "global": [
+      "daemon",
+      "spread-checks 2",
+      "user    haproxy",
+      "group   haproxy",
+      "maxconn 8192",
+      "log     /dev/log local1",
+"chroot  /var/lib/haproxy"
+    ],
+    "defaults": [
+      "log      global",
+      "option   dontlognull",
+      "option   log-separate-errors",
+      "maxconn  2000",
+      "timeout  connect 5s",
+      "timeout  check   5s",
+      "timeout  client  50s",
+      "timeout  server  50s",
+      "option   redispatch",
+      "retries  3",
+"balance  roundrobin"
+    ],
+    "extra_sections": {
+      "listen stats": [
+        "bind :3212",
+        "mode http",
+        "stats enable",
+"stats uri /"
+      ]
+    }
+  },
+  "statsd": {
+    "format": "statsd"
+  }
+}

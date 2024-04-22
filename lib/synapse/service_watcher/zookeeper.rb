@@ -271,6 +271,11 @@ class Synapse::ServiceWatcher
           unless @@zk_pool.has_key?(@zk_hosts)
             log.info "synapse: creating pooled connection to #{@zk_hosts}"
             @@zk_pool[@zk_hosts] = ZK.new(@zk_hosts, :timeout => 5, :thread => :per_callback)
+
+            @@zk_pool[@zk_hosts].event_handler.register_state_handler("CONNECTING") do |event|
+              zk_cleanup
+            end
+
             @@zk_pool_count[@zk_hosts] = 1
             log.info "synapse: successfully created zk connection to #{@zk_hosts}"
             statsd_increment('synapse.watcher.zk.client.created', ["zk_cluster:#{@zk_cluster}", "service_name:#{@name}"])

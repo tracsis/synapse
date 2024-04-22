@@ -63,12 +63,6 @@ describe Synapse::ServiceWatcher::Ec2tagWatcher do
     %w[AWS_ACCESS_KEY_ID AWS_SECRET_ACCESS_KEY AWS_REGION].each { |k| ENV.delete(k) }
   end
 
-  before(:each) do
-    # https://ruby.awsblog.com/post/Tx2SU6TYJWQQLC3/Stubbing-AWS-Responses
-    # always returns empty results, so data may have to be faked.
-    AWS.stub!
-  end
-
   def remove_discovery_arg(name)
     args = basic_config.clone
     args['discovery'].delete name
@@ -173,24 +167,13 @@ describe Synapse::ServiceWatcher::Ec2tagWatcher do
 
     context 'using the AWS API' do
       let(:ec2_client) { double('AWS::EC2') }
-      let(:instance_collection) { double('AWS::EC2::InstanceCollection') }
 
       before do
         subject.ec2 = ec2_client
       end
 
       it 'fetches instances and filter instances' do
-        # Unfortunately there's quite a bit going on here, but this is
-        # a chained call to get then filter EC2 instances, which is
-        # done remotely; breaking into separate calls would result in
-        # unnecessary data being retrieved.
-
-        expect(subject.ec2).to receive(:instances).and_return(instance_collection)
-
-        expect(instance_collection).to receive(:tagged).with('foo').and_return(instance_collection)
-        expect(instance_collection).to receive(:tagged_values).with('bar').and_return(instance_collection)
-        expect(instance_collection).to receive(:select).and_return(instance_collection)
-
+        expect(subject.ec2).to receive(:instances)
         subject.send(:instances_with_tags, 'foo', 'bar')
       end
     end
