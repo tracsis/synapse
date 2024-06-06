@@ -957,7 +957,7 @@ class Synapse::ConfigGenerator
       new_config << shared_frontend_lines.flatten if shared_frontend_lines
 
       log.debug "synapse: new haproxy config: #{new_config}"
-      return new_config.flatten.join("\n")
+      return new_config.flatten.join("\n") + "\n"
     end
 
     # pull out the shared frontend section if any
